@@ -1,0 +1,178 @@
+version: '2.2'
+
+services:
+  vault-app:
+    image: library/vault:0.11.5
+    container_name: vault-app
+    volumes:
+      - /opt/vaultStorage/file:/vault/file
+      - /opt/vaultStorage/config:/vault/config
+      - /opt/vaultStorage/policies:/vault/policies
+      - /opt/vaultStorage/data:/vault/data
+      - /opt/vaultStorage/logs:/vault/logs
+    cap_add:
+      - IPC_LOCK
+    environment:
+      - VAULT_ADDR=http://127.0.0.1:8200
+      - 'VAULT_LOCAL_CONFIG={"storage": {"file": {"path": "/vault/file"}},"listener":{"tcp":{"address":"0.0.0.0:8200","tls_disable":1}},"ui":true}'
+#  For Vault Enterprise version only https://github.com/hashicorp/terraform-aws-vault/tree/master/examples/vault-auto-unseal
+#      - VAULT_SEAL_TYPE=awskms
+#      - VAULT_AWSKMS_SEAL_KEY_ID=a13afcb1-d140-49f6-b8f6-277ea398ec57
+#      - AWS_ACCESS_KEY_ID=AK*********
+#      - AWS_SECRET_ACCESS_KEY=m1X/*******************
+#      - AWS_REGION=eu-central-1 
+    command: "server"
+    networks:
+      - ci_docker_network
+
+  vault-web:
+    image: djenriquez/vault-ui:latest
+    container_name: vault-web
+    environment:
+      - VAULT_URL_DEFAULT=http://vault-app:8200
+      - VAULT_AUTH_DEFAULT=USERNAMEPASSWORD
+    networks:
+      - ci_docker_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.backend=vault-web"
+      - "traefik.frontend.rule=Host:vault.aws.funkedigital.de"
+      - "traefik.port=8000"
+
+  artifactory:
+    image: docker.bintray.io/jfrog/artifactory-oss:5.5.1
+    container_name: artifactory
+    volumes:
+      - /opt/artifactoryStorage/data:/var/opt/jfrog/artifactory
+    restart: always
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 32000
+        hard: 40000
+    networks:
+      - ci_docker_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.backend=artifactory"
+      - "traefik.frontend.rule=Host:artifactory.aws.funkedigital.de"
+      - "traefik.port=8081"
+
+  jenkins-master:
+    container_name: jenkins-master
+    image: jenkins/jenkins:2.121.1
+    extra_hosts:
+      - "build.funkedigital.de:127.0.0.1"
+      - "build1.funkedigital.de:127.0.0.1"
+      - "build.aws.funkedigital.de:127.0.0.1"
+      - "build-test.aws.funkedigital.de:127.0.0.1"
+    environment:
+      - JENKINS_HOME=/var/jenkins_home
+      - JAVA_OPTS=-Duser.timezone=Europe/Berlin
+    logging:
+      options:
+        max-size: 150m
+    volumes:
+      - /opt/jenkinsMaster/data:/var/jenkins_home
+    healthcheck:
+      test: ["CMD", "curl", "-I", "localhost:8080/login"]
+      interval: 10s
+      timeout: 5m
+      retries: 30
+    restart: unless-stopped
+    networks:
+      - ci_docker_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.backend=jenkins-master"
+      - "traefik.frontend.rule=Host:build.aws.funkedigital.de"
+      - "traefik.port=8080"
+
+  jenkins-slave-1:
+    container_name: jenkins-slave-1
+    image: funkedigital/jenkins-slave:0.7.3
+    volumes:
+      - /opt/jenkinsSlave/data:/home/jenkins-slave/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -master http://jenkins-master:8080 -name jenkins-slave-1 -executors 4 -password sHK0wWiyhkP0hc -username jenkins-admin -showHostName
+    shm_size: '1gb'
+    logging:
+      options:
+        max-size: 150m
+    depends_on:
+      jenkins-master:
+        condition: service_healthy
+    networks:
+      - ci_docker_network
+
+  jenkins-slave-2:
+    container_name: jenkins-slave-2
+    image: funkedigital/jenkins-slave:0.7.3
+    volumes:
+      - /opt/jenkinsSlave/data:/home/jenkins-slave/workspace
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: -master http://jenkins-master:8080 -name jenkins-slave-2 -executors 4 -password sHK0wWiyhkP0hc -username jenkins-admin -showHostName
+    shm_size: '1gb'
+    logging:
+      options:
+        max-size: 150m
+    depends_on:
+      jenkins-master:
+        condition: service_healthy
+    networks:
+      - ci_docker_network
+
+  traefik:
+    image: traefik:latest
+    container_name: traefik
+    ports:
+      - 80:80
+      - 443:443
+      - 8880:8080
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./traefik.toml:/traefik.toml
+      - ./acme.json:/acme.json
+    networks:
+      - ci_docker_network
+
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    user: root
+    privileged: true
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)'
+    restart: unless-stopped
+    ports:
+      - "9100:9100"
+    networks:
+      - ci_docker_network
+
+  cadvisor:
+    image: google/cadvisor:v0.30.2
+    container_name: cadvisor
+    user: root
+    privileged: true
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /dev/disk/:/dev/disk:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /cgroup:/sys/fs/cgroup:ro
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - ci_docker_network
+
+networks:
+  ci_docker_network:
+    driver: bridge
